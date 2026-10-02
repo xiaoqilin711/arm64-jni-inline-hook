@@ -1,0 +1,13 @@
+# build artifacts
+build/
+*.o
+*.so
+*.a
+*.dex
+*.apk
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
