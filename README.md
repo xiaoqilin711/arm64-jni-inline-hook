@@ -1,53 +1,51 @@
 # arm64-jni-inline-hook
 
-一个**极简、零依赖的 arm64 JNI 免修复 inline hook 框架**。用于在 Android 加固 App 的 JNI native 方法入口处无痕落地参数与返回值——不开 frida-server、不注入 frida-agent，因此不触发"检测 `/proc/self/maps` 里 `/memfd:frida-agent` 特征"这类反 Frida 自毁。
-
-A minimal, dependency-free **ARM64 JNI fixup-free inline hook**. It lets you transparently dump the arguments and return value of a JNI native method in a hardened Android app — without running frida-server or injecting a frida-agent, so anti-Frida self-destructs that scan `/proc/self/maps` for `/memfd:frida-agent` never fire.
+A **minimal, dependency-free ARM64 JNI fixup-free inline hook**. It transparently dumps the arguments and return value of a JNI native method in a hardened Android app — without running frida-server or injecting a frida-agent, so anti-Frida self-destructs that scan `/proc/self/maps` for `/memfd:frida-agent` never fire.
 
 ---
 
-## 一句话定位
+## Positioning
 
-> 不是又一个"hook 引擎"，而是只解决一个真实、高杠杆的场景：**目标函数是 JNI native 方法、且其 prologue 前 16 字节无 PC 相对寻址**时，用 32 字节免修复 trampoline 把它重定向到你的 handler，handler 里 `GetStringUTFChars` 直接读明文参数。
+> Not another general-purpose "hook engine". It solves exactly one real, high-leverage case: when the target is a **JNI native method** whose prologue's first 16 bytes contain **no PC-relative addressing**, redirect it to your handler through a 32-byte fixup-free trampoline, then read the plaintext arguments with `GetStringUTFChars` inside the handler.
 
-## 为什么这么做
+## Why this exists
 
-常规 hook 方案在这个场景下的硬伤，是这套代码存在的原因：
+The failure modes of the usual approaches are the reason this code exists:
 
-| 方案 | 问题 |
-|------|------|
-| Frida (spawn/attach) | agent 以 memfd 映射进进程，`/proc/self/maps` 留下 `/memfd:frida-agent-64.so (deleted)`，被壳的 maps 扫描命中即 `abort()` 自毁 |
-| eCapture / eBPF uprobe | 只能挂系统 libssl/conscrypt；目标登录流量走 **Go 纯 crypto/tls**，根本不进系统库 |
-| 内核 HWBP | Go 1.15 栈式 ABI：明文 slice 指针在**栈**上，断点命中那刻寄存器里没有指针 |
+| Approach | Problem |
+|----------|---------|
+| Frida (spawn/attach) | The agent maps into the process via memfd, leaving `/memfd:frida-agent-64.so (deleted)` in `/proc/self/maps`; the packer's maps scanner hits it and calls `abort()` |
+| eCapture / eBPF uprobe | Only hooks the system libssl/conscrypt; the target's login traffic uses **Go's pure crypto/tls** and never enters the system TLS library |
+| Kernel HWBP | Go 1.15 stack-based ABI: the plaintext slice pointer lives on the **stack**, so no register holds it at the breakpoint |
 
-唯一能稳定活下来的路：**换注入载体**——用定制 ROM 的"任意 so 注入"，让目标进程 `dlopen` 一个普通的、你自己写的 so（不产生 memfd 映射），在 so 的 constructor 里对目标 JNI 方法下 inline hook。
+The one path that survives: **switch the injection carrier** — use a custom ROM's "arbitrary .so injection" to have the target process `dlopen` an ordinary .so you wrote (no memfd mapping), and install the inline hook from that .so's constructor.
 
-## 特性
+## Features
 
-- **免修复 trampoline**：prologue 前 16 字节无 PC 相对指令即可原样搬运，无需指令重定位。
-- **可验证的 PIC 预检**：`jnihook_prologue_is_pic()` 用 AArch64 硬件级判据（bit 26 = 所有分支指令；`ADR/ADRP`；`LDR-literal` 的 `bits[28:26]==110`）在打补丁前拒绝不可重定位的 prologue，避免"搬过去就跑飞"。
-- **零依赖**：只链 `log`，不依赖 Dobby/Substrate 等任何 hook 框架。
-- **普通 C dispatcher**：不手写 naked 汇编，控制流清晰、寄存器保存由编译器 ABI 保证。
-- **纯逻辑有单测**：PIC 预检是纯位运算，带主机端单元测试。
+- **Fixup-free trampoline**: if the prologue's first 16 bytes contain no PC-relative instruction, they are copied verbatim — no relocation needed.
+- **Verifiable PIC preflight**: `jnihook_prologue_is_pic()` rejects non-relocatable prologues before patching, using hardware-level AArch64 invariants (bit 26 = every branch; `ADR/ADRP`; `LDR-literal` has `bits[28:26] == 110`).
+- **Zero dependencies**: links only against `log`; no Dobby/Substrate or any other hook framework.
+- **Plain-C dispatcher**: no hand-written naked assembly; register preservation is guaranteed by the compiler's ABI.
+- **Unit-tested pure logic**: the PIC preflight is pure bit logic and ships with host-side unit tests.
 
-## 快速开始
+## Quick start
 
-### 1. 交叉编译
+### 1. Cross-compile
 
 ```bash
-NDK=/path/to/android-ndk ./build.sh        # 产出 build/libjnihook.so
+NDK=/path/to/android-ndk ./build.sh        # produces build/libjnihook.so
 ```
 
-或手动：
+or manually:
 
 ```bash
 $NDK/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android24-clang \
     -shared -fPIC -O2 -Iinclude src/jnihook.c -o libjnihook.so -llog
 ```
 
-### 2. 写你的 handler
+### 2. Write your handler
 
-参考 [examples/resource_api_dump.c](examples/resource_api_dump.c)。核心三步：
+See [examples/resource_api_dump.c](examples/resource_api_dump.c). The three essential steps:
 
 ```c
 #include "jnihook.h"
@@ -55,57 +53,57 @@ $NDK/toolchains/llvm/prebuilt/*/bin/aarch64-linux-android24-clang \
 static void* on_api(void* env, void* thiz, void* a1, void* a2,
                     void* a3, void* a4, void* a5, void** orig) {
     JNIEnv* e = (JNIEnv*)env;
-    jstring url = (jstring)a1;                 // 参数按 JNI 寄存器序落位
+    jstring url = (jstring)a1;                 /* args land in JNI register order */
     const char* s = (*e)->GetStringUTFChars(e, url, NULL);
-    /* ... 落地 s ... */
-    return *orig;                              // 或调用原函数后返回其结果
+    /* ... persist s ... */
+    return *orig;                              /* or call the original, return its result */
 }
 
-/* 在 constructor 里轮询找到目标 so 基址后： */
+/* from a constructor, after polling for the target library's base address: */
 jnihook_install((void*)(base + TARGET_OFF), on_api, &orig);
 ```
 
-### 3. 注入目标进程
+### 3. Inject into the target process
 
-用你手上 ROM 的"任意 so 注入"路径（**不是 Frida**），把编译出的 so 放进加载目录，App 下次启动即自动 `dlopen`，constructor 触发 hook。
+Use your ROM's "arbitrary .so injection" path (**not** Frida). Put the compiled .so into the loader directory; the app `dlopen`s it on next launch and the constructor installs the hook.
 
-## 架构
+## Architecture
 
 ```
-原始调用
+original call
   │
   ├─ target(0xXXXX)  ── patch ──▶  ldr x16,#8; br x16; .quad jnihook_dispatch
   │                                        │
   │                                        ▼
-  │                            jnihook_dispatch (普通 C 函数)
+  │                            jnihook_dispatch (ordinary C function)
   │                                        │
   │                              ┌─────────┴─────────┐
   │                              │                   │
-  │                        你的 handler ──▶ orig() = trampoline
-  │                              │             └─ 原 prologue 16B
-  │                              │                └─ 原函数体 (只执行一次)
+  │                        your handler ──▶ orig() = trampoline
+  │                              │             └─ original prologue (16B)
+  │                              │                └─ original body (runs exactly once)
   │                              │
-  │                              └── handler 返回值 ──▶ 原始调用者
+  │                              └── handler return value ──▶ original caller
 ```
 
-- `Trampoline`：`[原 16 字节] + ldr x16,#8 + br x16 + .quad target+16`（32B，RWX mmap）。
-- `Patch`：`ldr x16,#8 + br x16 + .quad jnihook_dispatch`（16B，覆盖 prologue）。
-- `jnihook_dispatch` 是普通 C 函数，编译器生成 ABI 兼容的 prologue/epilogue，自动保存/恢复 callee-saved 寄存器与返回地址。
+- **Trampoline**: `[16 original bytes] + ldr x16,#8 + br x16 + .quad target+16` (32B, RWX mmap).
+- **Patch**: `ldr x16,#8 + br x16 + .quad jnihook_dispatch` (16B, overwrites the prologue).
+- **`jnihook_dispatch`** is an ordinary C function; the compiler emits an ABI-compliant prologue/epilogue that saves/restores callee-saved registers and the return address.
 
-## 诚实边界
+## Honest boundaries
 
-**这里不写"能 X 却没验证"的能力。** 明确以下几点：
+Nothing here claims an unverified capability. Specifically:
 
-1. **只支持 ARM64**。32 位 ARM / x86 未实现、未验证。
-2. **只支持 JNI 方法且 ≤5 个整型/指针参数**（`this` + x2..x6）。第 6 个参数（x7）与浮点参数（d0-d7）不保存、不转发。
-3. **prologue 必须 PIC**。含 `ADR/ADRP/B/BL/B.cond/CBZ/TBZ/BR/LDR-literal` 的函数会被拒绝（返回 `-1`）。
-4. **未做 .text CRC 对抗**。若目标 so 有 `.text` 完整性自校验，改 16 字节可能触发二次自毁。本框架只保证"注入不产生 frida-agent memfd 特征"，不保证绕过所有完整性校验。
-5. **单元测试未在真机执行**：`tests/test_pic.c` 已交叉编译为 arm64 可执行文件，但仓库作者的 Windows 环境无主机编译器、无连接设备，故 PIC 判据经**反汇编逐条核对** + 交叉编译验证，未在设备上运行。推设备后 `adb shell /data/local/tmp/test_pic` 即可跑。
-6. 抓包位置是 **JNI 业务层参数**，不是网卡线缆级字节；Go `net/http` 发出时追加的底层头不在此层可见。
+1. **ARM64 only.** 32-bit ARM / x86 are not implemented or tested.
+2. **JNI methods with ≤5 integer/pointer arguments only** (`this` + x2..x6). The 6th argument (x7) and floating-point arguments (d0-d7) are neither saved nor forwarded.
+3. **The prologue must be PIC.** Functions containing `ADR/ADRP/B/BL/B.cond/CBZ/TBZ/BR/LDR-literal` are rejected (return `-1`).
+4. **No `.text` CRC countermeasures.** If the target .so self-verifies its `.text` integrity, changing 16 bytes may trigger a second self-destruct. This framework only guarantees "the injection leaves no frida-agent memfd mapping", not that all integrity checks are bypassed.
+5. **Unit tests not yet executed on-device**: `tests/test_pic.c` cross-compiles to an arm64 executable, but the authoring environment had no host compiler and no connected device, so the PIC invariants were verified by per-instruction disassembly + cross-compilation, not execution. Push the binary and run `adb shell /data/local/tmp/test_pic`.
+6. The capture point is the **JNI business-layer arguments**, not on-the-wire bytes; low-level headers appended by Go `net/http` are not visible at this layer.
 
-## 实战复盘
+## Case study
 
-完整过程（走通的与撞墙的）见 [docs/case-study.md](docs/case-study.md)：一条"抓某加固 App 登录请求"的授权测试，从 eCapture / Frida / HWBP 三条死路，到最终锁定 JNI 业务入口用本框架落地的全过程。
+The full write-up — what worked and what dead-ended — is in [docs/case-study.md](docs/case-study.md): an authorized engagement to capture a hardened app's login request, from the eCapture / Frida / HWBP dead ends to the JNI business-layer entry point this framework lands on.
 
 ## License
 
